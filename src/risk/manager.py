@@ -23,10 +23,44 @@ class RiskManager:
         self.limits = limits or RiskLimits()
         self._peak_equity: float | None = None
         self._day_start_equity: float | None = None
+        self._day_start_date: str | None = None
         self._trading_halted = False
 
     def reset_day(self, equity: float) -> None:
+        from datetime import date
         self._day_start_equity = equity
+        self._day_start_date = date.today().isoformat()
+
+    def to_state(self):
+        from src.risk.state_store import RiskManagerState
+        return RiskManagerState(
+            peak_equity=self._peak_equity,
+            day_start_equity=self._day_start_equity,
+            day_start_date=self._day_start_date,
+            trading_halted=self._trading_halted,
+        )
+
+    def load_state(self, state) -> None:
+        """Restore state from a prior process (see RiskStateStore). If the
+        loaded state is from a previous calendar day, day_start_equity is
+        NOT restored as-is — call reset_day() with fresh equity afterward
+        to start the new day's tracking correctly. peak_equity and the
+        halted flag persist across days by design (a halt should require
+        deliberate human review to clear, not just a date rollover)."""
+        self._peak_equity = state.peak_equity
+        self._trading_halted = state.trading_halted
+
+        from src.risk.state_store import RiskStateStore
+        if not RiskStateStore.is_new_day(state):
+            self._day_start_equity = state.day_start_equity
+            self._day_start_date = state.day_start_date
+        # else: leave day fields unset; caller should invoke reset_day()
+
+    def manually_clear_halt(self) -> None:
+        """Explicit, deliberately-named method to resume trading after a
+        halt. Not called automatically anywhere — a human should decide
+        this, ideally after understanding why the halt triggered."""
+        self._trading_halted = False
 
     def update_peak(self, equity: float) -> None:
         if self._peak_equity is None or equity > self._peak_equity:

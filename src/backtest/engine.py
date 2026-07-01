@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from src.backtest.trade_analytics import pair_trades, compute_trade_stats, trades_to_dataframe
 from src.risk.manager import RiskManager, RiskLimits
 from src.strategies.base import Strategy
 
@@ -33,6 +34,7 @@ class BacktestResult:
     equity_curve: pd.Series
     positions: pd.Series
     trades: pd.DataFrame
+    round_trip_trades: pd.DataFrame
     metrics: dict
 
 
@@ -56,13 +58,34 @@ class Backtester:
         position_history = []
         trades = []
 
-        risk.reset_day(cash)
+        current_day = None
 
         for i, (ts, row) in enumerate(bars.iterrows()):
             price = row["close"]
             current_equity = cash + shares_held * price
 
+            # Reset daily-loss tracking once per calendar day, not once for
+            # the whole backtest -- otherwise max_daily_loss_pct silently
+            # becomes "max loss since backtest start", a much stricter and
+            # mislabeled check over a multi-day/multi-year backtest.
+            bar_day = ts.date() if hasattr(ts, "date") else ts
+            if bar_day != current_day:
+                risk.reset_day(current_equity)
+                current_day = bar_day
+
             halted = risk.check_halt(current_equity)
+
+            # If a drawdown/daily-loss halt just triggered while still
+            # holding a position, force-close it rather than letting it
+            # continue to mark-to-market indefinitely. A "halt" that still
+            # lets existing exposure ride is not actually a risk control.
+            if halted and shares_held != 0:
+                fill_price = self._apply_slippage(price, sell=shares_held > 0)
+                proceeds = shares_held * fill_price
+                cash += proceeds - abs(shares_held) * self.config.commission_per_share
+                trades.append(self._trade_record(ts, symbol, -shares_held, fill_price, "RISK_HALT"))
+                shares_held = 0.0
+                entry_price = 0.0
 
             # Per-trade stop loss, checked every bar regardless of new signals
             if shares_held != 0 and not halted:
@@ -112,12 +135,16 @@ class Backtester:
         position_series = pd.Series(position_history, index=bars.index, name="shares_held")
         trades_df = pd.DataFrame(trades)
 
-        metrics = self._compute_metrics(equity_series, trades_df)
+        round_trips = pair_trades(trades_df, bars.index) if not trades_df.empty else []
+        round_trips_df = trades_to_dataframe(round_trips)
+
+        metrics = self._compute_metrics(equity_series, trades_df, round_trips)
 
         return BacktestResult(
             equity_curve=equity_series,
             positions=position_series,
             trades=trades_df,
+            round_trip_trades=round_trips_df,
             metrics=metrics,
         )
 
@@ -136,7 +163,7 @@ class Backtester:
         }
 
     @staticmethod
-    def _compute_metrics(equity: pd.Series, trades: pd.DataFrame) -> dict:
+    def _compute_metrics(equity: pd.Series, trades: pd.DataFrame, round_trips: list) -> dict:
         returns = equity.pct_change().dropna()
 
         total_return = (equity.iloc[-1] / equity.iloc[0]) - 1 if len(equity) > 1 else 0.0
@@ -147,21 +174,31 @@ class Backtester:
         ann_vol = returns.std() * np.sqrt(ann_factor) if len(returns) > 1 else 0.0
         sharpe = ann_return / ann_vol if ann_vol > 0 else 0.0
 
+        # Sortino: like Sharpe but only penalizes downside volatility —
+        # a strategy with big upside swings shouldn't be penalized the same
+        # as one with big downside swings.
+        downside_returns = returns[returns < 0]
+        downside_vol = downside_returns.std() * np.sqrt(ann_factor) if len(downside_returns) > 1 else 0.0
+        sortino = ann_return / downside_vol if downside_vol > 0 else 0.0
+
         running_max = equity.cummax()
         drawdown = (equity - running_max) / running_max
         max_drawdown = drawdown.min() if len(drawdown) else 0.0
 
-        win_rate = None
-        if not trades.empty and "reason" in trades.columns:
-            closing_trades = trades[trades["shares"] != 0]
-            win_rate = None  # requires trade-pairing logic; left for the notebook-level analysis
+        calmar = ann_return / abs(max_drawdown) if max_drawdown < 0 else None
 
-        return {
+        trade_stats = compute_trade_stats(round_trips)
+
+        metrics = {
             "total_return_pct": round(total_return * 100, 2),
             "annualized_return_pct": round(ann_return * 100, 2),
             "annualized_volatility_pct": round(ann_vol * 100, 2),
             "sharpe_ratio": round(sharpe, 2),
+            "sortino_ratio": round(sortino, 2),
+            "calmar_ratio": round(calmar, 2) if calmar is not None else None,
             "max_drawdown_pct": round(max_drawdown * 100, 2),
             "num_trades": int((trades["shares"] != 0).sum()) if not trades.empty else 0,
             "final_equity": round(equity.iloc[-1], 2) if len(equity) else None,
         }
+        metrics.update(trade_stats)
+        return metrics
