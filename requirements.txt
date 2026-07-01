@@ -5,5 +5,8 @@ pyarrow>=14.0
 matplotlib>=3.7
 pytest>=7.4
 
+# Optional: only needed for the desktop GUI (run_gui.py)
+# PySide6>=6.5
+
 # Optional: only needed for live/paper execution against Webull
 # webull-openapi-python-sdk>=2.0.12
