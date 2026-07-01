@@ -1,0 +1,15 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Historical data cache (populated at runtime by HistoricalDataLoader)
+data_cache/
+
+# Persisted risk state (written by run_live.py)
+risk_state.json
+
+# Credentials — never commit
+.env
+
+# Backtest chart outputs
+*.png
