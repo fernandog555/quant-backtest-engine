@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 
 from src.backtest.engine import Backtester, BacktestConfig
+from src.backtest.walk_forward import WalkForwardValidator
 from src.data.loader import HistoricalDataLoader
 from src.risk.manager import RiskLimits
 from src.strategies.buy_and_hold import BuyAndHold
@@ -35,6 +36,11 @@ def main():
         help="Which strategy to run (default: run all and compare)",
     )
     parser.add_argument("--capital", type=float, default=100_000, help="Starting capital")
+    parser.add_argument(
+        "--walk-forward", action="store_true", help="Run walk-forward validation instead of a single backtest"
+    )
+    parser.add_argument("--train-bars", type=int, default=252, help="Walk-forward train window size (bars)")
+    parser.add_argument("--test-bars", type=int, default=63, help="Walk-forward test window size (bars)")
     args = parser.parse_args()
 
     loader = HistoricalDataLoader()
@@ -46,10 +52,27 @@ def main():
         slippage_bps=5,
         risk_limits=RiskLimits(max_position_pct=0.9, max_gross_exposure_pct=1.0),
     )
-    bt = Backtester(config)
 
     strategy_names = [args.strategy] if args.strategy != "all" else list(STRATEGY_REGISTRY.keys())
 
+    if args.walk_forward:
+        wf = WalkForwardValidator(
+            backtest_config=config, train_bars=args.train_bars, test_bars=args.test_bars
+        )
+        for name in strategy_names:
+            factory = STRATEGY_REGISTRY[name]
+            report = wf.run(bars, factory, symbol=args.symbol)
+            print(f"--- Walk-forward: {name} ({report.combined_metrics['num_windows']} windows) ---")
+            for k, v in report.combined_metrics.items():
+                print(f"  {k}: {v}")
+            print()
+            print(report.per_window_metrics[
+                ["test_start", "test_end", "total_return_pct", "sharpe_ratio", "max_drawdown_pct"]
+            ].to_string(index=False))
+            print()
+        return
+
+    bt = Backtester(config)
     for name in strategy_names:
         strategy = STRATEGY_REGISTRY[name]()
         result = bt.run(bars, strategy, symbol=args.symbol)

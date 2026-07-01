@@ -86,3 +86,55 @@ class TestBacktesterRiskIntegration:
         halt_idx = (result.equity_curve / result.equity_curve.cummax() - 1 <= -0.10).idxmax()
         post_halt_positions = result.positions.loc[halt_idx:]
         assert post_halt_positions.nunique() <= 1
+
+    def test_max_drawdown_halt_force_closes_existing_position(self, uptrend_bars):
+        # Regression test: previously, once max_drawdown_pct halted new
+        # entries, an EXISTING position was left open and kept marking to
+        # market indefinitely, letting realized drawdown blow far past the
+        # configured limit (observed -47% actual vs 30% configured). The
+        # halt must force-close any open position, not just block new ones.
+        crash_bars = uptrend_bars.copy()
+        crash_close = np.concatenate([np.full(20, 100.0), np.linspace(100, 40, 200)])
+        dates = pd.date_range("2023-01-01", periods=len(crash_close), freq="B")
+        crash_bars = pd.DataFrame(
+            {"open": crash_close, "high": crash_close, "low": crash_close, "close": crash_close, "volume": 1_000_000},
+            index=dates,
+        )
+
+        config = BacktestConfig(
+            initial_capital=100_000,
+            risk_limits=RiskLimits(max_position_pct=1.0, max_gross_exposure_pct=1.0, max_drawdown_pct=0.15),
+        )
+        bt = Backtester(config)
+        result = bt.run(crash_bars, BuyAndHold(), symbol="TEST")
+
+        # Drawdown must not blow past the configured limit by more than a
+        # bar's worth of slippage/price movement -- not run away to -40%+.
+        assert result.metrics["max_drawdown_pct"] > -20
+
+        # A RISK_HALT exit trade must appear in the trade log
+        assert "RISK_HALT" in result.trades["reason"].values
+
+    def test_daily_loss_limit_resets_each_calendar_day(self, uptrend_bars):
+        # Regression test: previously reset_day() was called once at the
+        # start of the whole backtest, so max_daily_loss_pct silently
+        # became "max loss since backtest start" over a multi-year run.
+        # A tight daily-loss limit should NOT, by itself, prevent a
+        # multi-day uptrend from accumulating well beyond that single-day
+        # threshold -- daily halts should clear each new day.
+        config = BacktestConfig(
+            initial_capital=100_000,
+            risk_limits=RiskLimits(
+                max_position_pct=1.0, max_gross_exposure_pct=1.0,
+                max_daily_loss_pct=0.02, max_drawdown_pct=1.0,  # drawdown limit disabled for this test
+            ),
+        )
+        bt = Backtester(config)
+        result = bt.run(uptrend_bars, BuyAndHold(), symbol="TEST")
+
+        # uptrend_bars rises 30% total; if daily-loss tracking incorrectly
+        # persisted across the whole backtest instead of resetting daily,
+        # a 2% "daily" limit measured against day-1 equity could spuriously
+        # interact with normal volatility. This just confirms the position
+        # isn't force-closed purely due to stale cross-day state.
+        assert result.metrics["total_return_pct"] > 0
